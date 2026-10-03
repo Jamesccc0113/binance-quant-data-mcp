@@ -8,11 +8,7 @@ BINANCE_BASE = "https://fapi.binance.com"
 
 ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
-mcp = FastMCP(
-    "Binance Quant Data",
-    stateless_http=True,
-    json_response=True,
-)
+mcp = FastMCP("Binance Quant Data")
 
 
 def now_utc():
