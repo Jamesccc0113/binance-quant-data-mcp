@@ -146,9 +146,11 @@ async def get_klines(
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
 
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=port,
-        path="/mcp",
-    )
+mcp.run(
+    transport="streamable-http",
+    host="0.0.0.0",
+    port=port,
+    path="/mcp",
+    stateless_http=True,
+    json_response=True,
+)
