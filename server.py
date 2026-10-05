@@ -1,15 +1,32 @@
 import asyncio
 import json
+import logging
 import os
 import random
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 from websockets.asyncio.client import connect
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("binance_quant_data")
 
 
 # ============================================================
@@ -21,9 +38,25 @@ BINANCE_WS_BASE = "wss://fstream.binance.com/market/stream"
 
 ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 ALLOWED_INTERVALS = {
-    "1m", "5m", "15m", "1h", "4h", "1d", "1w", "1M"
+    "1m",
+    "5m",
+    "15m",
+    "1h",
+    "4h",
+    "1d",
+    "1w",
+    "1M",
 }
-INTERVAL_ORDER = ["1m", "5m", "15m", "1h", "4h", "1d", "1w", "1M"]
+INTERVAL_ORDER = [
+    "1m",
+    "5m",
+    "15m",
+    "1h",
+    "4h",
+    "1d",
+    "1w",
+    "1M",
+]
 
 STREAMS = [
     f"{symbol.lower()}@kline_{interval}"
@@ -33,42 +66,78 @@ STREAMS = [
 WS_URL = f"{BINANCE_WS_BASE}?streams=" + "/".join(STREAMS)
 
 # REST safety
-REST_MIN_INTERVAL_SECONDS = float(os.getenv("REST_MIN_INTERVAL_SECONDS", "1.5"))
-REST_WEIGHT_LIMIT = int(os.getenv("REST_WEIGHT_LIMIT", "2400"))
-REST_WEIGHT_SAFETY_RATIO = float(os.getenv("REST_WEIGHT_SAFETY_RATIO", "0.75"))
-HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
-FALLBACK_429_COOLDOWN = int(os.getenv("FALLBACK_429_COOLDOWN", "120"))
-FALLBACK_418_COOLDOWN = int(os.getenv("FALLBACK_418_COOLDOWN", "3600"))
+REST_MIN_INTERVAL_SECONDS = float(
+    os.getenv("REST_MIN_INTERVAL_SECONDS", "1.5")
+)
+REST_WEIGHT_LIMIT = int(
+    os.getenv("REST_WEIGHT_LIMIT", "2400")
+)
+REST_WEIGHT_SAFETY_RATIO = float(
+    os.getenv("REST_WEIGHT_SAFETY_RATIO", "0.75")
+)
+HTTP_TIMEOUT_SECONDS = float(
+    os.getenv("HTTP_TIMEOUT_SECONDS", "15")
+)
+FALLBACK_429_COOLDOWN = int(
+    os.getenv("FALLBACK_429_COOLDOWN", "120")
+)
+FALLBACK_418_COOLDOWN = int(
+    os.getenv("FALLBACK_418_COOLDOWN", "3600")
+)
 
 # WebSocket safety
-# Maximum time a tool call waits for the background WebSocket manager
-# to complete its initial connection attempt. This does NOT touch REST.
-WS_STARTUP_WAIT_SECONDS = float(os.getenv("WS_STARTUP_WAIT_SECONDS", "10"))
-WS_MIN_RECONNECT_SECONDS = float(os.getenv("WS_MIN_RECONNECT_SECONDS", "5"))
-WS_MAX_RECONNECT_SECONDS = float(os.getenv("WS_MAX_RECONNECT_SECONDS", "300"))
-WS_ROTATE_SECONDS = int(
-    os.getenv("WS_ROTATE_SECONDS", str(23 * 60 * 60 + 50 * 60))
+WS_STARTUP_WAIT_SECONDS = float(
+    os.getenv("WS_STARTUP_WAIT_SECONDS", "10")
 )
-MAX_CACHED_CANDLES = int(os.getenv("MAX_CACHED_CANDLES", "1000"))
+WS_MIN_RECONNECT_SECONDS = float(
+    os.getenv("WS_MIN_RECONNECT_SECONDS", "5")
+)
+WS_MAX_RECONNECT_SECONDS = float(
+    os.getenv("WS_MAX_RECONNECT_SECONDS", "300")
+)
+WS_ROTATE_SECONDS = int(
+    os.getenv(
+        "WS_ROTATE_SECONDS",
+        str(23 * 60 * 60 + 50 * 60),
+    )
+)
+MAX_CACHED_CANDLES = int(
+    os.getenv("MAX_CACHED_CANDLES", "1000")
+)
+
+SERVICE_VERSION = "phase-a-v5"
 
 
 # ============================================================
 # MCP SERVER
 # ============================================================
 
-mcp = FastMCP("Binance Quant Data")
+mcp = FastMCP(
+    "Binance Quant Data",
+    version=SERVICE_VERSION,
+)
 
 
 # ============================================================
 # RUNTIME STATE
 # ============================================================
 
-_candle_cache: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(
+_candle_cache: dict[
+    tuple[str, str],
+    deque[dict[str, Any]],
+] = defaultdict(
     lambda: deque(maxlen=MAX_CACHED_CANDLES)
 )
-_live_candles: dict[tuple[str, str], dict[str, Any]] = {}
 
-_ws_stream_stats: dict[tuple[str, str], dict[str, Any]] = {
+_live_candles: dict[
+    tuple[str, str],
+    dict[str, Any],
+] = {}
+
+_ws_stream_stats: dict[
+    tuple[str, str],
+    dict[str, Any],
+] = {
     (symbol, interval): {
         "message_count": 0,
         "closed_candle_count": 0,
@@ -103,6 +172,7 @@ _rest_last_success_at: float | None = None
 # BASIC HELPERS
 # ============================================================
 
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -114,7 +184,10 @@ def epoch_ms() -> int:
 def format_utc_timestamp(timestamp_ms: int | None) -> str | None:
     if timestamp_ms is None:
         return None
-    return datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc).isoformat()
+    return datetime.fromtimestamp(
+        timestamp_ms / 1000,
+        timezone.utc,
+    ).isoformat()
 
 
 def remaining_seconds(timestamp: float | None) -> int:
@@ -127,7 +200,8 @@ def validate_symbol(symbol: str) -> str:
     symbol = symbol.upper().strip()
     if symbol not in ALLOWED_SYMBOLS:
         raise ValueError(
-            f"Unsupported symbol={symbol}. Allowed={sorted(ALLOWED_SYMBOLS)}"
+            f"Unsupported symbol={symbol}. "
+            f"Allowed={sorted(ALLOWED_SYMBOLS)}"
         )
     return symbol
 
@@ -135,7 +209,8 @@ def validate_symbol(symbol: str) -> str:
 def validate_interval(interval: str) -> str:
     if interval not in ALLOWED_INTERVALS:
         raise ValueError(
-            f"Unsupported interval={interval}. Allowed={INTERVAL_ORDER}"
+            f"Unsupported interval={interval}. "
+            f"Allowed={INTERVAL_ORDER}"
         )
     return interval
 
@@ -146,7 +221,9 @@ def validate_limit(limit: int) -> int:
     return limit
 
 
-def parse_retry_after(headers: httpx.Headers) -> int | None:
+def parse_retry_after(
+    headers: httpx.Headers,
+) -> int | None:
     value = headers.get("Retry-After")
     if value is None:
         return None
@@ -156,15 +233,22 @@ def parse_retry_after(headers: httpx.Headers) -> int | None:
         return None
 
 
-def extract_binance_headers(headers: httpx.Headers) -> dict[str, str]:
+def extract_binance_headers(
+    headers: httpx.Headers,
+) -> dict[str, str]:
     return {
         key.lower(): value
         for key, value in headers.items()
-        if key.lower().startswith("x-mbx-") or key.lower() == "retry-after"
+        if (
+            key.lower().startswith("x-mbx-")
+            or key.lower() == "retry-after"
+        )
     }
 
 
-def get_used_weight(headers: httpx.Headers) -> int | None:
+def get_used_weight(
+    headers: httpx.Headers,
+) -> int | None:
     for key, value in headers.items():
         if key.upper() == "X-MBX-USED-WEIGHT-1M":
             try:
@@ -200,21 +284,44 @@ def structured_error(
 # CANDLE VALIDATION
 # ============================================================
 
-def validate_candles(candles: list[dict[str, Any]]) -> dict[str, Any]:
-    timestamps = [candle["open_time_ms"] for candle in candles]
-    duplicates = len(timestamps) != len(set(timestamps))
+
+def validate_candles(
+    candles: list[dict[str, Any]],
+) -> dict[str, Any]:
+    timestamps = [
+        candle["open_time_ms"]
+        for candle in candles
+    ]
+
+    duplicates = (
+        len(timestamps)
+        != len(set(timestamps))
+    )
+
     timestamp_ordered = all(
         timestamps[index] < timestamps[index + 1]
         for index in range(len(timestamps) - 1)
     )
+
     ohlc_valid = all(
-        candle["high"] >= max(candle["open"], candle["close"])
-        and candle["low"] <= min(candle["open"], candle["close"])
+        candle["high"] >= max(
+            candle["open"],
+            candle["close"],
+        )
+        and candle["low"] <= min(
+            candle["open"],
+            candle["close"],
+        )
         and candle["high"] >= candle["low"]
         and candle["volume"] >= 0
         for candle in candles
     )
-    all_closed = all(candle["is_closed"] for candle in candles)
+
+    all_closed = all(
+        candle["is_closed"]
+        for candle in candles
+    )
+
     return {
         "row_count": len(candles),
         "duplicates": duplicates,
@@ -228,69 +335,140 @@ def validate_candles(candles: list[dict[str, Any]]) -> dict[str, Any]:
 # CACHE HELPERS
 # ============================================================
 
-def upsert_closed_candle(key: tuple[str, str], candle: dict[str, Any]) -> None:
-    """Insert/replace by open_time_ms and keep the cache sorted."""
+
+def upsert_closed_candle(
+    key: tuple[str, str],
+    candle: dict[str, Any],
+) -> None:
+    """Insert or replace by open_time_ms and keep cache sorted."""
     cache = _candle_cache[key]
-    by_open_time = {item["open_time_ms"]: item for item in cache}
+
+    by_open_time = {
+        item["open_time_ms"]: item
+        for item in cache
+    }
+
     by_open_time[candle["open_time_ms"]] = candle
-    ordered = sorted(by_open_time.values(), key=lambda item: item["open_time_ms"])
+
+    ordered = sorted(
+        by_open_time.values(),
+        key=lambda item: item["open_time_ms"],
+    )
+
     cache.clear()
-    cache.extend(ordered[-MAX_CACHED_CANDLES:])
+    cache.extend(
+        ordered[-MAX_CACHED_CANDLES:]
+    )
 
 
-def cache_candle_source(candles: list[dict[str, Any]]) -> str:
+def cache_candle_source(
+    candles: list[dict[str, Any]],
+) -> str:
     if not candles:
         return "none"
-    sources = {candle.get("source") for candle in candles}
+
+    sources = {
+        candle.get("source")
+        for candle in candles
+    }
+
     if sources == {"binance_websocket"}:
         return "websocket_cache"
+
     if sources == {"binance_rest"}:
         return "binance_rest_backfill"
+
     return "mixed_websocket_cache_and_rest"
 
 
-def build_cache_entry(symbol: str, interval: str) -> dict[str, Any]:
-    cache = _candle_cache[(symbol, interval)]
-    stats = _ws_stream_stats[(symbol, interval)]
+def build_cache_entry(
+    symbol: str,
+    interval: str,
+) -> dict[str, Any]:
+    cache = _candle_cache[
+        (symbol, interval)
+    ]
+
+    stats = _ws_stream_stats[
+        (symbol, interval)
+    ]
+
     return {
         "symbol": symbol,
         "interval": interval,
         "closed_candle_count": len(cache),
-        "latest_closed_open_time_ms": cache[-1]["open_time_ms"] if cache else None,
-        "latest_closed_open_time_utc": (
-            format_utc_timestamp(cache[-1]["open_time_ms"]) if cache else None
+        "latest_closed_open_time_ms": (
+            cache[-1]["open_time_ms"]
+            if cache
+            else None
         ),
-        "has_live_candle": (symbol, interval) in _live_candles,
-        "websocket_stream_received_messages": stats["message_count"],
-        "websocket_stream_closed_candles_seen": stats["closed_candle_count"],
-        "websocket_last_event_at_utc": stats["last_event_at_utc"],
-        "websocket_last_open_time_ms": stats["last_open_time_ms"],
-        "websocket_last_open_time_utc": format_utc_timestamp(
+        "latest_closed_open_time_utc": (
+            format_utc_timestamp(
+                cache[-1]["open_time_ms"]
+            )
+            if cache
+            else None
+        ),
+        "has_live_candle": (
+            (symbol, interval)
+            in _live_candles
+        ),
+        "websocket_stream_received_messages": (
+            stats["message_count"]
+        ),
+        "websocket_stream_closed_candles_seen": (
+            stats["closed_candle_count"]
+        ),
+        "websocket_last_event_at_utc": (
+            stats["last_event_at_utc"]
+        ),
+        "websocket_last_open_time_ms": (
             stats["last_open_time_ms"]
         ),
-        "websocket_last_close_time_ms": stats["last_close_time_ms"],
-        "websocket_last_is_closed": stats["last_is_closed"],
-        "websocket_last_source": stats["last_source"],
+        "websocket_last_open_time_utc": (
+            format_utc_timestamp(
+                stats["last_open_time_ms"]
+            )
+        ),
+        "websocket_last_close_time_ms": (
+            stats["last_close_time_ms"]
+        ),
+        "websocket_last_is_closed": (
+            stats["last_is_closed"]
+        ),
+        "websocket_last_source": (
+            stats["last_source"]
+        ),
     }
 
 
 # ============================================================
-# REST RATE-LIMIT / CIRCUIT BREAKER
+# REST RATE LIMIT / CIRCUIT BREAKER
 # ============================================================
+
 
 async def rest_pacing() -> None:
     global _rest_last_request_at
+
     now = time.monotonic()
-    wait_seconds = REST_MIN_INTERVAL_SECONDS - (now - _rest_last_request_at)
+    wait_seconds = (
+        REST_MIN_INTERVAL_SECONDS
+        - (now - _rest_last_request_at)
+    )
+
     if wait_seconds > 0:
         await asyncio.sleep(wait_seconds)
+
     _rest_last_request_at = time.monotonic()
 
 
 async def protected_rest_get(
     path: str,
     params: dict[str, Any] | None = None,
-) -> tuple[Any | None, dict[str, Any] | None]:
+) -> tuple[
+    Any | None,
+    dict[str, Any] | None,
+]:
     global _rest_blocked_until
     global _rest_last_status
     global _rest_last_headers
@@ -298,7 +476,9 @@ async def protected_rest_get(
     global _rest_last_success_at
 
     if time.time() < _rest_blocked_until:
-        seconds = remaining_seconds(_rest_blocked_until)
+        seconds = remaining_seconds(
+            _rest_blocked_until
+        )
         return None, structured_error(
             "REST_LOCAL_COOLDOWN",
             "REST access is locally blocked. No Binance request was sent.",
@@ -312,29 +492,49 @@ async def protected_rest_get(
         try:
             async with _rest_lock:
                 await rest_pacing()
-                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+
+                async with httpx.AsyncClient(
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                ) as client:
                     response = await client.get(
                         url,
                         params=params,
-                        headers={"User-Agent": "BinanceQuantDataMCP/PhaseA"},
+                        headers={
+                            "User-Agent":
+                            "BinanceQuantDataMCP/PhaseA"
+                        },
                     )
 
             _rest_last_status = response.status_code
-            _rest_last_headers = extract_binance_headers(response.headers)
-            used_weight = get_used_weight(response.headers)
+            _rest_last_headers = extract_binance_headers(
+                response.headers
+            )
+
+            used_weight = get_used_weight(
+                response.headers
+            )
 
             if used_weight is not None:
                 safety_threshold = int(
-                    REST_WEIGHT_LIMIT * REST_WEIGHT_SAFETY_RATIO
+                    REST_WEIGHT_LIMIT
+                    * REST_WEIGHT_SAFETY_RATIO
                 )
                 if used_weight >= safety_threshold:
-                    _rest_blocked_until = time.time() + 60
+                    _rest_blocked_until = (
+                        time.time() + 60
+                    )
 
             if response.status_code == 429:
-                retry_after = parse_retry_after(response.headers)
+                retry_after = parse_retry_after(
+                    response.headers
+                )
                 if retry_after is None:
                     retry_after = FALLBACK_429_COOLDOWN
-                _rest_blocked_until = time.time() + retry_after
+
+                _rest_blocked_until = (
+                    time.time() + retry_after
+                )
+
                 error = structured_error(
                     "BINANCE_RATE_LIMITED",
                     "Binance returned HTTP 429. REST requests are stopped until Retry-After expires. No retry was performed.",
@@ -348,10 +548,16 @@ async def protected_rest_get(
                 return None, error
 
             if response.status_code == 418:
-                retry_after = parse_retry_after(response.headers)
+                retry_after = parse_retry_after(
+                    response.headers
+                )
                 if retry_after is None:
                     retry_after = FALLBACK_418_COOLDOWN
-                _rest_blocked_until = time.time() + retry_after
+
+                _rest_blocked_until = (
+                    time.time() + retry_after
+                )
+
                 error = structured_error(
                     "BINANCE_IP_BANNED",
                     "Binance returned HTTP 418. REST requests are stopped until Retry-After expires. No retry was performed.",
@@ -365,12 +571,19 @@ async def protected_rest_get(
                 return None, error
 
             if response.status_code in (403, 451):
-                code = "BINANCE_WAF_BLOCK" if response.status_code == 403 else "BINANCE_GEO_OR_POLICY_BLOCK"
+                code = (
+                    "BINANCE_WAF_BLOCK"
+                    if response.status_code == 403
+                    else "BINANCE_GEO_OR_POLICY_BLOCK"
+                )
+
                 error = structured_error(
                     code,
                     "Binance rejected the request. No retry was attempted.",
                     http_status=response.status_code,
-                    retry_after_seconds=parse_retry_after(response.headers),
+                    retry_after_seconds=parse_retry_after(
+                        response.headers
+                    ),
                     url=url,
                     headers=_rest_last_headers,
                     body=response.text[:1000],
@@ -382,6 +595,7 @@ async def protected_rest_get(
                 response.raise_for_status()
 
             response.raise_for_status()
+
             _rest_last_success_at = time.time()
             _rest_last_error = None
             return response.json(), None
@@ -392,20 +606,30 @@ async def protected_rest_get(
             httpx.ConnectTimeout,
         ) as exc:
             last_exception = exc
+
         except httpx.HTTPStatusError as exc:
             last_exception = exc
+
         except Exception as exc:
             last_exception = exc
             break
 
-        backoff_seconds = min(30.0, (2 ** attempt) + random.uniform(0, 1))
+        backoff_seconds = min(
+            30.0,
+            (2 ** attempt)
+            + random.uniform(0, 1),
+        )
         await asyncio.sleep(backoff_seconds)
 
     error = structured_error(
         "BINANCE_NETWORK_OR_5XX_ERROR",
         "Binance REST request failed after bounded transient-error retries.",
         url=url,
-        body=str(last_exception)[:1000] if last_exception else None,
+        body=(
+            str(last_exception)[:1000]
+            if last_exception
+            else None
+        ),
     )
     _rest_last_error = error
     return None, error
@@ -415,8 +639,12 @@ async def protected_rest_get(
 # WEBSOCKET CACHE
 # ============================================================
 
-def ws_candle_to_dict(event: dict[str, Any]) -> dict[str, Any]:
+
+def ws_candle_to_dict(
+    event: dict[str, Any],
+) -> dict[str, Any]:
     kline = event["k"]
+
     return {
         "open_time_ms": int(kline["t"]),
         "open": float(kline["o"]),
@@ -447,7 +675,13 @@ async def websocket_manager() -> None:
 
     while True:
         connection_started = time.monotonic()
+
         try:
+            logger.info(
+                "WebSocket connecting: %s",
+                WS_URL,
+            )
+
             async with connect(
                 WS_URL,
                 open_timeout=10,
@@ -461,7 +695,16 @@ async def websocket_manager() -> None:
                 _ws_last_error = None
                 reconnect_delay = WS_MIN_RECONNECT_SECONDS
 
-                while time.monotonic() - connection_started < WS_ROTATE_SECONDS:
+                logger.info(
+                    "WebSocket connected; streams=%d",
+                    len(STREAMS),
+                )
+
+                while (
+                    time.monotonic()
+                    - connection_started
+                    < WS_ROTATE_SECONDS
+                ):
                     raw = await websocket.recv()
                     _ws_last_message_at = time.time()
 
@@ -475,30 +718,51 @@ async def websocket_manager() -> None:
                         continue
 
                     kline = event.get("k", {})
-                    symbol = str(kline.get("s", "")).upper()
-                    interval = str(kline.get("i", ""))
+                    symbol = str(
+                        kline.get("s", "")
+                    ).upper()
+                    interval = str(
+                        kline.get("i", "")
+                    )
 
-                    if symbol not in ALLOWED_SYMBOLS or interval not in ALLOWED_INTERVALS:
+                    if (
+                        symbol not in ALLOWED_SYMBOLS
+                        or interval not in ALLOWED_INTERVALS
+                    ):
                         continue
 
                     key = (symbol, interval)
                     candle = ws_candle_to_dict(event)
                     stats = _ws_stream_stats[key]
+
                     stats["message_count"] += 1
                     stats["last_event_at_utc"] = utc_now()
-                    stats["last_open_time_ms"] = candle["open_time_ms"]
-                    stats["last_close_time_ms"] = candle["close_time_ms"]
-                    stats["last_is_closed"] = candle["is_closed"]
-                    stats["last_source"] = "binance_websocket"
+                    stats["last_open_time_ms"] = (
+                        candle["open_time_ms"]
+                    )
+                    stats["last_close_time_ms"] = (
+                        candle["close_time_ms"]
+                    )
+                    stats["last_is_closed"] = (
+                        candle["is_closed"]
+                    )
+                    stats["last_source"] = (
+                        "binance_websocket"
+                    )
 
                     _live_candles[key] = candle
 
                     if candle["is_closed"]:
                         stats["closed_candle_count"] += 1
-                        upsert_closed_candle(key, candle)
+                        upsert_closed_candle(
+                            key,
+                            candle,
+                        )
 
         except asyncio.CancelledError:
+            logger.info("WebSocket manager cancelled")
             raise
+
         except Exception as exc:
             _ws_reconnect_count += 1
             _ws_last_error = {
@@ -507,43 +771,48 @@ async def websocket_manager() -> None:
                 "timestamp_utc": utc_now(),
                 "reconnect_delay_seconds": reconnect_delay,
             }
+            logger.exception(
+                "WebSocket manager error"
+            )
+
         finally:
             _ws_connected = False
 
         await asyncio.sleep(
             reconnect_delay
-            + random.uniform(0, min(5.0, reconnect_delay * 0.25))
+            + random.uniform(
+                0,
+                min(
+                    5.0,
+                    reconnect_delay * 0.25,
+                ),
+            )
         )
-        reconnect_delay = min(WS_MAX_RECONNECT_SECONDS, reconnect_delay * 2)
+
+        reconnect_delay = min(
+            WS_MAX_RECONNECT_SECONDS,
+            reconnect_delay * 2,
+        )
 
 
 async def ensure_websocket_started(
     wait_for_startup: bool = True,
     timeout_seconds: float | None = None,
 ) -> None:
-    """
-    Start the long-lived WebSocket manager if necessary.
-
-    Important: the previous implementation created the task and
-    immediately returned. On the first tool call this could produce
-    a perfectly healthy server with connected=false simply because
-    the background task had not been scheduled far enough to complete
-    the WebSocket handshake.
-
-    This version optionally waits briefly for either:
-    - WebSocket connected
-    - a WebSocket error to be recorded
-    - the startup timeout to expire
-
-    It never calls REST.
-    """
+    """Start the WebSocket manager and optionally wait for initial progress."""
     global _ws_task
     global _ws_task_started_at
     global _ws_last_error
 
-    if _ws_task is None or _ws_task.done():
+    if (
+        _ws_task is None
+        or _ws_task.done()
+    ):
         _ws_last_error = None
-        _ws_task = asyncio.create_task(websocket_manager())
+        _ws_task = asyncio.create_task(
+            websocket_manager(),
+            name="binance-websocket-manager",
+        )
         _ws_task_started_at = time.time()
 
     if not wait_for_startup:
@@ -561,17 +830,42 @@ async def ensure_websocket_started(
         if _ws_connected or _ws_last_error is not None:
             return
 
-        if _ws_task is not None and _ws_task.done():
+        if (
+            _ws_task is not None
+            and _ws_task.done()
+        ):
             return
 
         await asyncio.sleep(0.1)
+
+
+async def stop_websocket_manager() -> None:
+    global _ws_task
+    global _ws_connected
+
+    task = _ws_task
+    _ws_task = None
+
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    _ws_connected = False
 
 
 # ============================================================
 # REST BACKFILL
 # ============================================================
 
-async def rest_backfill(symbol: str, interval: str, limit: int) -> dict[str, Any]:
+
+async def rest_backfill(
+    symbol: str,
+    interval: str,
+    limit: int,
+) -> dict[str, Any]:
     raw, error = await protected_rest_get(
         "/fapi/v1/klines",
         {
@@ -582,15 +876,20 @@ async def rest_backfill(symbol: str, interval: str, limit: int) -> dict[str, Any
     )
 
     if error:
-        return {"status": "DATA_UNAVAILABLE", "error": error}
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "error": error,
+        }
 
     current_ms = epoch_ms()
     closed_candles: list[dict[str, Any]] = []
 
     for row in raw or []:
         close_time_ms = int(row[6])
+
         if close_time_ms >= current_ms:
             continue
+
         closed_candles.append(
             {
                 "open_time_ms": int(row[0]),
@@ -611,8 +910,12 @@ async def rest_backfill(symbol: str, interval: str, limit: int) -> dict[str, Any
         )
 
     key = (symbol, interval)
+
     for candle in closed_candles:
-        upsert_closed_candle(key, candle)
+        upsert_closed_candle(
+            key,
+            candle,
+        )
 
     return {
         "status": "PASS",
@@ -625,40 +928,55 @@ async def rest_backfill(symbol: str, interval: str, limit: int) -> dict[str, Any
 # MCP TOOLS
 # ============================================================
 
+
 @mcp.tool
 async def ping() -> dict[str, Any]:
     """MCP health check. Does NOT call Binance REST."""
     await ensure_websocket_started()
+
     return {
         "status": "PASS",
         "service": "Binance Quant Data",
+        "service_version": SERVICE_VERSION,
         "market_type": "Binance USDⓈ-M Futures",
         "websocket": {
             "connected": _ws_connected,
             "connected_at_utc": (
-                format_utc_timestamp(int(_ws_connected_at * 1000))
-                if _ws_connected_at else None
+                format_utc_timestamp(
+                    int(_ws_connected_at * 1000)
+                )
+                if _ws_connected_at
+                else None
             ),
             "last_message_at_utc": (
-                format_utc_timestamp(int(_ws_last_message_at * 1000))
-                if _ws_last_message_at else None
+                format_utc_timestamp(
+                    int(_ws_last_message_at * 1000)
+                )
+                if _ws_last_message_at
+                else None
             ),
             "reconnect_count": _ws_reconnect_count,
             "last_error": _ws_last_error,
             "task_started_at_utc": (
-                format_utc_timestamp(int(_ws_task_started_at * 1000))
-                if _ws_task_started_at else None
+                format_utc_timestamp(
+                    int(_ws_task_started_at * 1000)
+                )
+                if _ws_task_started_at
+                else None
             ),
             "task_done": (
                 _ws_task.done()
-                if _ws_task is not None else None
+                if _ws_task is not None
+                else None
             ),
             "stream_count": len(STREAMS),
             "expected_streams": STREAMS,
         },
         "rest": {
             "last_http_status": _rest_last_status,
-            "blocked_seconds_remaining": remaining_seconds(_rest_blocked_until),
+            "blocked_seconds_remaining": remaining_seconds(
+                _rest_blocked_until
+            ),
             "last_error": _rest_last_error,
             "last_headers": _rest_last_headers,
         },
@@ -672,10 +990,15 @@ async def rest_status() -> dict[str, Any]:
     return {
         "status": "PASS",
         "last_http_status": _rest_last_status,
-        "blocked_seconds_remaining": remaining_seconds(_rest_blocked_until),
+        "blocked_seconds_remaining": remaining_seconds(
+            _rest_blocked_until
+        ),
         "last_success_at_utc": (
-            format_utc_timestamp(int(_rest_last_success_at * 1000))
-            if _rest_last_success_at else None
+            format_utc_timestamp(
+                int(_rest_last_success_at * 1000)
+            )
+            if _rest_last_success_at
+            else None
         ),
         "last_error": _rest_last_error,
         "last_headers": _rest_last_headers,
@@ -687,18 +1010,36 @@ async def rest_status() -> dict[str, Any]:
 async def websocket_status() -> dict[str, Any]:
     """Show WebSocket connection/cache summary. Does NOT call REST."""
     await ensure_websocket_started()
+
     cache_status: dict[str, Any] = {}
 
     for symbol in sorted(ALLOWED_SYMBOLS):
         for interval in INTERVAL_ORDER:
-            entry = build_cache_entry(symbol, interval)
-            cache_status[f"{symbol}:{interval}"] = {
-                "closed_candle_count": entry["closed_candle_count"],
-                "latest_open_time_ms": entry["latest_closed_open_time_ms"],
-                "has_live_candle": entry["has_live_candle"],
-                "websocket_stream_received_messages": entry["websocket_stream_received_messages"],
-                "websocket_last_is_closed": entry["websocket_last_is_closed"],
-                "websocket_last_event_at_utc": entry["websocket_last_event_at_utc"],
+            entry = build_cache_entry(
+                symbol,
+                interval,
+            )
+            cache_status[
+                f"{symbol}:{interval}"
+            ] = {
+                "closed_candle_count": (
+                    entry["closed_candle_count"]
+                ),
+                "latest_open_time_ms": (
+                    entry["latest_closed_open_time_ms"]
+                ),
+                "has_live_candle": (
+                    entry["has_live_candle"]
+                ),
+                "websocket_stream_received_messages": (
+                    entry["websocket_stream_received_messages"]
+                ),
+                "websocket_last_is_closed": (
+                    entry["websocket_last_is_closed"]
+                ),
+                "websocket_last_event_at_utc": (
+                    entry["websocket_last_event_at_utc"]
+                ),
             }
 
     return {
@@ -706,17 +1047,24 @@ async def websocket_status() -> dict[str, Any]:
         "connected": _ws_connected,
         "reconnect_count": _ws_reconnect_count,
         "last_message_at_utc": (
-            format_utc_timestamp(int(_ws_last_message_at * 1000))
-            if _ws_last_message_at else None
+            format_utc_timestamp(
+                int(_ws_last_message_at * 1000)
+            )
+            if _ws_last_message_at
+            else None
         ),
         "last_error": _ws_last_error,
         "task_started_at_utc": (
-            format_utc_timestamp(int(_ws_task_started_at * 1000))
-            if _ws_task_started_at else None
+            format_utc_timestamp(
+                int(_ws_task_started_at * 1000)
+            )
+            if _ws_task_started_at
+            else None
         ),
         "task_done": (
             _ws_task.done()
-            if _ws_task is not None else None
+            if _ws_task is not None
+            else None
         ),
         "configured_stream_count": len(STREAMS),
         "configured_streams": STREAMS,
@@ -727,20 +1075,14 @@ async def websocket_status() -> dict[str, Any]:
 
 @mcp.tool
 async def websocket_cache_status() -> dict[str, Any]:
-    """
-    Detailed WebSocket/cache diagnostics.
-
-    Does NOT call Binance REST.
-
-    message_count > 0 means the kline stream for that interval is
-    actually delivering events to this process, even if no candle has
-    closed yet. closed_candle_count > 0 means a closed candle has been
-    cached since this service instance started.
-    """
+    """Detailed WebSocket/cache diagnostics. Does NOT call Binance REST."""
     await ensure_websocket_started()
 
     streams = {
-        f"{symbol}:{interval}": build_cache_entry(symbol, interval)
+        f"{symbol}:{interval}": build_cache_entry(
+            symbol,
+            interval,
+        )
         for symbol in sorted(ALLOWED_SYMBOLS)
         for interval in INTERVAL_ORDER
     }
@@ -750,22 +1092,32 @@ async def websocket_cache_status() -> dict[str, Any]:
         "websocket": {
             "connected": _ws_connected,
             "connected_at_utc": (
-                format_utc_timestamp(int(_ws_connected_at * 1000))
-                if _ws_connected_at else None
+                format_utc_timestamp(
+                    int(_ws_connected_at * 1000)
+                )
+                if _ws_connected_at
+                else None
             ),
             "last_message_at_utc": (
-                format_utc_timestamp(int(_ws_last_message_at * 1000))
-                if _ws_last_message_at else None
+                format_utc_timestamp(
+                    int(_ws_last_message_at * 1000)
+                )
+                if _ws_last_message_at
+                else None
             ),
             "reconnect_count": _ws_reconnect_count,
             "last_error": _ws_last_error,
             "task_started_at_utc": (
-                format_utc_timestamp(int(_ws_task_started_at * 1000))
-                if _ws_task_started_at else None
+                format_utc_timestamp(
+                    int(_ws_task_started_at * 1000)
+                )
+                if _ws_task_started_at
+                else None
             ),
             "task_done": (
                 _ws_task.done()
-                if _ws_task is not None else None
+                if _ws_task is not None
+                else None
             ),
             "startup_wait_seconds": WS_STARTUP_WAIT_SECONDS,
             "configured_stream_count": len(STREAMS),
@@ -778,14 +1130,7 @@ async def websocket_cache_status() -> dict[str, Any]:
 
 @mcp.tool
 async def websocket_probe() -> dict[str, Any]:
-    """
-    One-shot WebSocket connectivity probe.
-
-    This opens the exact configured Binance market WebSocket URL, waits
-    for the first market-data message, reports the result, then closes
-    the probe connection. It does NOT call Binance REST and does not
-    modify the long-lived cache.
-    """
+    """One-shot exact-URL WebSocket connectivity probe; never calls REST."""
     started = utc_now()
     started_monotonic = time.monotonic()
 
@@ -808,16 +1153,35 @@ async def websocket_probe() -> dict[str, Any]:
 
             payload = json.loads(raw)
             event = payload.get("data", payload)
-            kline = event.get("k", {}) if isinstance(event, dict) else {}
+            kline = (
+                event.get("k", {})
+                if isinstance(event, dict)
+                else {}
+            )
 
             return {
                 "status": "PASS",
                 "connected": True,
-                "first_event_type": event.get("e") if isinstance(event, dict) else None,
-                "symbol": str(kline.get("s", "")).upper() or None,
+                "first_event_type": (
+                    event.get("e")
+                    if isinstance(event, dict)
+                    else None
+                ),
+                "symbol": (
+                    str(kline.get("s", "")).upper()
+                    or None
+                ),
                 "interval": kline.get("i"),
-                "event_time_ms": event.get("E") if isinstance(event, dict) else None,
-                "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                "event_time_ms": (
+                    event.get("E")
+                    if isinstance(event, dict)
+                    else None
+                ),
+                "elapsed_seconds": round(
+                    time.monotonic()
+                    - started_monotonic,
+                    3,
+                ),
                 "rest_called": False,
                 "started_at_utc": started,
                 "timestamp_utc": utc_now(),
@@ -831,7 +1195,11 @@ async def websocket_probe() -> dict[str, Any]:
                 "code": "WEBSOCKET_PROBE_FAILED",
                 "message": str(exc)[:1000],
             },
-            "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+            "elapsed_seconds": round(
+                time.monotonic()
+                - started_monotonic,
+                3,
+            ),
             "rest_called": False,
             "started_at_utc": started,
             "timestamp_utc": utc_now(),
@@ -844,11 +1212,7 @@ async def get_cached_klines(
     interval: str = "1h",
     limit: int = 1,
 ) -> dict[str, Any]:
-    """
-    Read ONLY from the WebSocket closed-candle cache.
-
-    This tool NEVER calls REST and never triggers REST fallback.
-    """
+    """Read ONLY from WebSocket closed-candle cache; never calls REST."""
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     limit = validate_limit(limit)
@@ -858,10 +1222,13 @@ async def get_cached_klines(
     cache = _candle_cache[key]
     candles = list(cache)[-limit:]
     quality = validate_candles(candles)
-    enough_rows = len(candles) >= limit
 
     return {
-        "status": "PASS" if enough_rows else "DATA_UNAVAILABLE",
+        "status": (
+            "PASS"
+            if len(candles) >= limit
+            else "DATA_UNAVAILABLE"
+        ),
         "source": "websocket_cache",
         "market_type": "Binance USDⓈ-M Futures",
         "symbol": symbol,
@@ -880,9 +1247,16 @@ async def get_cached_klines(
 @mcp.tool
 async def rest_ping() -> dict[str, Any]:
     """Explicitly test Binance REST connectivity; protected by breaker."""
-    data, error = await protected_rest_get("/fapi/v1/time")
+    data, error = await protected_rest_get(
+        "/fapi/v1/time"
+    )
+
     if error:
-        return {"status": "DATA_UNAVAILABLE", "error": error}
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "error": error,
+        }
+
     return {
         "status": "PASS",
         "source": "Binance",
@@ -898,13 +1272,7 @@ async def get_klines(
     interval: str = "1h",
     limit: int = 5,
 ) -> dict[str, Any]:
-    """
-    Production path:
-    1) WebSocket closed-candle cache
-    2) One protected REST backfill if cache is insufficient
-
-    Unlike get_cached_klines(), this tool MAY call REST.
-    """
+    """Production path: WebSocket cache first, protected REST fallback second."""
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     limit = validate_limit(limit)
@@ -915,7 +1283,12 @@ async def get_klines(
     rest_used = False
 
     if len(cache) < limit:
-        result = await rest_backfill(symbol, interval, limit)
+        result = await rest_backfill(
+            symbol,
+            interval,
+            limit,
+        )
+
         if result["status"] != "PASS":
             return {
                 "status": "DATA_UNAVAILABLE",
@@ -927,13 +1300,18 @@ async def get_klines(
                 "rest_called": True,
                 "timestamp_utc": utc_now(),
             }
+
         rest_used = True
 
     candles = list(cache)[-limit:]
     quality = validate_candles(candles)
 
     return {
-        "status": "PASS" if quality["row_count"] == limit else "PARTIAL",
+        "status": (
+            "PASS"
+            if quality["row_count"] == limit
+            else "PARTIAL"
+        ),
         "source": cache_candle_source(candles),
         "market_type": "Binance USDⓈ-M Futures",
         "symbol": symbol,
@@ -945,7 +1323,9 @@ async def get_klines(
         "rest_called": rest_used,
         "rest_protection": {
             "last_http_status": _rest_last_status,
-            "blocked_seconds_remaining": remaining_seconds(_rest_blocked_until),
+            "blocked_seconds_remaining": remaining_seconds(
+                _rest_blocked_until
+            ),
         },
         "timestamp_utc": utc_now(),
     }
@@ -956,12 +1336,15 @@ async def get_live_candle(
     symbol: str = "BTCUSDT",
     interval: str = "1m",
 ) -> dict[str, Any]:
-    """Return the current forming WebSocket candle. Does NOT call REST."""
+    """Return the current forming WebSocket candle; never calls REST."""
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     await ensure_websocket_started()
 
-    candle = _live_candles.get((symbol, interval))
+    candle = _live_candles.get(
+        (symbol, interval)
+    )
+
     if candle is None:
         return {
             "status": "DATA_UNAVAILABLE",
@@ -984,16 +1367,81 @@ async def get_live_candle(
 
 
 # ============================================================
-# START SERVER
+# HTTP APP / RENDER HEALTH CHECK
+# ============================================================
+
+mcp_http_app = mcp.http_app(
+    path="/mcp",
+    stateless_http=True,
+    json_response=True,
+)
+
+
+async def health(request: Request) -> JSONResponse:
+    """Process health only; never calls Binance REST."""
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "Binance Quant Data",
+            "service_version": SERVICE_VERSION,
+            "rest_touched": False,
+            "websocket_connected": _ws_connected,
+            "configured_stream_count": len(STREAMS),
+            "timestamp_utc": utc_now(),
+        }
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    """
+    Combine the FastMCP HTTP lifespan with this process's WebSocket task.
+
+    The MCP application's lifespan is entered first. The background
+    Binance WebSocket task is then started without blocking HTTP startup.
+    On shutdown, the WebSocket task is cancelled cleanly.
+    """
+    async with mcp_http_app.lifespan(app):
+        await ensure_websocket_started(
+            wait_for_startup=False
+        )
+        logger.info(
+            "Service started: version=%s streams=%d",
+            SERVICE_VERSION,
+            len(STREAMS),
+        )
+        yield
+        await stop_websocket_manager()
+        logger.info("Service stopped")
+
+
+app = Starlette(
+    routes=[
+        Route("/health", health, methods=["GET"]),
+        Route("/healthz", health, methods=["GET"]),
+        Mount("/", app=mcp_http_app),
+    ],
+    lifespan=lifespan,
+)
+
+
+# ============================================================
+# LOCAL ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    mcp.run(
-        transport="streamable-http",
+    import uvicorn
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000",
+        )
+    )
+
+    uvicorn.run(
+        app,
         host="0.0.0.0",
         port=port,
-        path="/mcp",
-        stateless_http=True,
-        json_response=True,
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
     )
