@@ -446,6 +446,7 @@ async def websocket_manager() -> None:
         try:
             async with connect(
                 WS_URL,
+                open_timeout=10,
                 ping_interval=20,
                 ping_timeout=20,
                 close_timeout=10,
@@ -512,10 +513,52 @@ async def websocket_manager() -> None:
         reconnect_delay = min(WS_MAX_RECONNECT_SECONDS, reconnect_delay * 2)
 
 
-async def ensure_websocket_started() -> None:
+async def ensure_websocket_started(
+    wait_for_startup: bool = True,
+    timeout_seconds: float | None = None,
+) -> None:
+    """
+    Start the long-lived WebSocket manager if necessary.
+
+    Important: the previous implementation created the task and
+    immediately returned. On the first tool call this could produce
+    a perfectly healthy server with connected=false simply because
+    the background task had not been scheduled far enough to complete
+    the WebSocket handshake.
+
+    This version optionally waits briefly for either:
+    - WebSocket connected
+    - a WebSocket error to be recorded
+    - the startup timeout to expire
+
+    It never calls REST.
+    """
     global _ws_task
+    global _ws_task_started_at
+
     if _ws_task is None or _ws_task.done():
         _ws_task = asyncio.create_task(websocket_manager())
+        _ws_task_started_at = time.time()
+
+    if not wait_for_startup:
+        return
+
+    timeout = (
+        WS_STARTUP_WAIT_SECONDS
+        if timeout_seconds is None
+        else max(0.0, timeout_seconds)
+    )
+
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        if _ws_connected or _ws_last_error is not None:
+            return
+
+        if _ws_task is not None and _ws_task.done():
+            return
+
+        await asyncio.sleep(0.1)
 
 
 # ============================================================
@@ -596,6 +639,14 @@ async def ping() -> dict[str, Any]:
             ),
             "reconnect_count": _ws_reconnect_count,
             "last_error": _ws_last_error,
+            "task_started_at_utc": (
+                format_utc_timestamp(int(_ws_task_started_at * 1000))
+                if _ws_task_started_at else None
+            ),
+            "task_done": (
+                _ws_task.done()
+                if _ws_task is not None else None
+            ),
             "stream_count": len(STREAMS),
             "expected_streams": STREAMS,
         },
@@ -653,6 +704,14 @@ async def websocket_status() -> dict[str, Any]:
             if _ws_last_message_at else None
         ),
         "last_error": _ws_last_error,
+        "task_started_at_utc": (
+            format_utc_timestamp(int(_ws_task_started_at * 1000))
+            if _ws_task_started_at else None
+        ),
+        "task_done": (
+            _ws_task.done()
+            if _ws_task is not None else None
+        ),
         "configured_stream_count": len(STREAMS),
         "configured_streams": STREAMS,
         "cache": cache_status,
@@ -694,12 +753,82 @@ async def websocket_cache_status() -> dict[str, Any]:
             ),
             "reconnect_count": _ws_reconnect_count,
             "last_error": _ws_last_error,
+            "task_started_at_utc": (
+                format_utc_timestamp(int(_ws_task_started_at * 1000))
+                if _ws_task_started_at else None
+            ),
+            "task_done": (
+                _ws_task.done()
+                if _ws_task is not None else None
+            ),
             "configured_stream_count": len(STREAMS),
         },
         "streams": streams,
         "rest_touched": False,
         "timestamp_utc": utc_now(),
     }
+
+
+@mcp.tool
+async def websocket_probe() -> dict[str, Any]:
+    """
+    One-shot WebSocket connectivity probe.
+
+    This opens the exact configured Binance market WebSocket URL, waits
+    for the first market-data message, reports the result, then closes
+    the probe connection. It does NOT call Binance REST and does not
+    modify the long-lived cache.
+    """
+    started = utc_now()
+    started_monotonic = time.monotonic()
+
+    try:
+        async with connect(
+            WS_URL,
+            open_timeout=10,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+            max_queue=1024,
+        ) as websocket:
+            raw = await asyncio.wait_for(
+                websocket.recv(),
+                timeout=10,
+            )
+
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+
+            payload = json.loads(raw)
+            event = payload.get("data", payload)
+            kline = event.get("k", {}) if isinstance(event, dict) else {}
+
+            return {
+                "status": "PASS",
+                "connected": True,
+                "first_event_type": event.get("e") if isinstance(event, dict) else None,
+                "symbol": str(kline.get("s", "")).upper() or None,
+                "interval": kline.get("i"),
+                "event_time_ms": event.get("E") if isinstance(event, dict) else None,
+                "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                "rest_called": False,
+                "started_at_utc": started,
+                "timestamp_utc": utc_now(),
+            }
+
+    except Exception as exc:
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "connected": False,
+            "error": {
+                "code": "WEBSOCKET_PROBE_FAILED",
+                "message": str(exc)[:1000],
+            },
+            "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+            "rest_called": False,
+            "started_at_utc": started,
+            "timestamp_utc": utc_now(),
+        }
 
 
 @mcp.tool
