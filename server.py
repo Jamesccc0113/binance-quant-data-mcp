@@ -41,6 +41,9 @@ FALLBACK_429_COOLDOWN = int(os.getenv("FALLBACK_429_COOLDOWN", "120"))
 FALLBACK_418_COOLDOWN = int(os.getenv("FALLBACK_418_COOLDOWN", "3600"))
 
 # WebSocket safety
+# Maximum time a tool call waits for the background WebSocket manager
+# to complete its initial connection attempt. This does NOT touch REST.
+WS_STARTUP_WAIT_SECONDS = float(os.getenv("WS_STARTUP_WAIT_SECONDS", "10"))
 WS_MIN_RECONNECT_SECONDS = float(os.getenv("WS_MIN_RECONNECT_SECONDS", "5"))
 WS_MAX_RECONNECT_SECONDS = float(os.getenv("WS_MAX_RECONNECT_SECONDS", "300"))
 WS_ROTATE_SECONDS = int(
@@ -80,6 +83,7 @@ _ws_stream_stats: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 _ws_task: asyncio.Task | None = None
+_ws_task_started_at: float | None = None
 _ws_connected = False
 _ws_connected_at: float | None = None
 _ws_last_message_at: float | None = None
@@ -535,8 +539,10 @@ async def ensure_websocket_started(
     """
     global _ws_task
     global _ws_task_started_at
+    global _ws_last_error
 
     if _ws_task is None or _ws_task.done():
+        _ws_last_error = None
         _ws_task = asyncio.create_task(websocket_manager())
         _ws_task_started_at = time.time()
 
@@ -761,6 +767,7 @@ async def websocket_cache_status() -> dict[str, Any]:
                 _ws_task.done()
                 if _ws_task is not None else None
             ),
+            "startup_wait_seconds": WS_STARTUP_WAIT_SECONDS,
             "configured_stream_count": len(STREAMS),
         },
         "streams": streams,
